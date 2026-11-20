@@ -3,7 +3,7 @@ import tempfile
 
 import streamlit as st
 
-from shopping_agent import agent
+from shopping_agent import CustomerContext, agent, find_customer
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -14,9 +14,49 @@ st.title("🛒 AI Shopping Assistant")
 st.caption("Tell me what you want — I'll search, rate, and order the best match for you.")
 
 # ---------------------------------------------------------------------------
+# Customer login — must identify before using the assistant
+# ---------------------------------------------------------------------------
+@st.dialog("Welcome! Who's shopping today?", dismissible=False)
+def login_dialog():
+    with st.form("login_form", border=False):
+        name = st.text_input("Your name", placeholder="e.g. John Doe")
+        submitted = st.form_submit_button("Continue", use_container_width=True)
+
+    if submitted:
+        matches = find_customer(name) if name.strip() else []
+        if len(matches) == 1:
+            customer_id, customer_name, _ = matches[0]
+            st.session_state.customer_id = customer_id
+            st.session_state.customer_name = customer_name
+            st.rerun()
+        elif len(matches) > 1:
+            st.error("More than one customer has that name. Please contact support.")
+        else:
+            st.error("We couldn't find a customer with that name. Please check the spelling.")
+
+
+if "customer_id" not in st.session_state:
+    login_dialog()
+    st.stop()
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+customer_context = CustomerContext(
+    customer_id=st.session_state.customer_id,
+    customer_name=st.session_state.customer_name,
+)
+
+# ---------------------------------------------------------------------------
 # Sidebar — shop by image
 # ---------------------------------------------------------------------------
 with st.sidebar:
+    st.markdown(f"Signed in as **{st.session_state.customer_name}**")
+    if st.button("Switch customer", use_container_width=True):
+        st.session_state.clear()
+        st.rerun()
+    st.divider()
+
     st.header("Shop by Image")
     st.caption("Upload a photo of a product and I'll find similar items in our store.")
 
@@ -41,8 +81,6 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # Chat state
 # ---------------------------------------------------------------------------
-if "messages" not in st.session_state:
-    st.session_state.messages = []
 
 # Render history — show a friendlier label for image-search messages
 for msg in st.session_state.messages:
@@ -63,7 +101,7 @@ if (
 ):
     with st.chat_message("assistant"):
         with st.spinner("Analyzing image and searching…"):
-            result = agent.invoke({"messages": st.session_state.messages})
+            result = agent.invoke({"messages": st.session_state.messages}, context=customer_context)
             response = result["messages"][-1].content.replace("`", "")
         st.markdown(response.replace("$", r"\$"))
 
@@ -81,7 +119,7 @@ if prompt := st.chat_input("e.g. I want organic honey under $15 with 4+ rating")
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking…"):
-            result = agent.invoke({"messages": st.session_state.messages})
+            result = agent.invoke({"messages": st.session_state.messages}, context=customer_context)
             response = result["messages"][-1].content.replace("`", "")
         st.markdown(response.replace("$", r"\$"))
 

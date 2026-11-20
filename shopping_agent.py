@@ -2,11 +2,12 @@ import base64
 import json
 import os
 import sqlite3
+from dataclasses import dataclass
 from typing import Optional
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
-from langchain.tools import tool
+from langchain.tools import ToolRuntime, tool
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 
@@ -15,6 +16,37 @@ from reviews_api import get_product_rating
 load_dotenv()
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "store.db")
+
+
+@dataclass
+class CustomerContext:
+    """Per-session context passed to the agent at invoke time (never chosen by the LLM)."""
+    customer_id: int
+    customer_name: str
+
+
+def ensure_schema() -> None:
+    """Add orders.customer_id to databases created before that column existed."""
+    conn = sqlite3.connect(DB_PATH)
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(orders)")]
+    if cols and "customer_id" not in cols:
+        conn.execute("ALTER TABLE orders ADD COLUMN customer_id INTEGER")
+        conn.commit()
+    conn.close()
+
+
+def find_customer(name: str) -> list[tuple[int, str, str]]:
+    """Return (id, name, email) for customers whose name matches (case-insensitive, trimmed)."""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT id, name, email FROM customers WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))",
+        (name,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+ensure_schema()
 
 llm = ChatOpenAI(model="gpt-5-mini", temperature=0)
 vision_llm = ChatOpenAI(model="gpt-5-mini", temperature=0)
@@ -80,11 +112,13 @@ def get_rating(product_id: int) -> str:
 
 
 @tool
-def checkout(product_id: int) -> str:
+def checkout(product_id: int, runtime: ToolRuntime[CustomerContext]) -> str:
     """
-    Place an order for the given product ID. Saves the order to the database and returns
-    a confirmation message with the order ID, product name, and price.
+    Place an order for the given product ID on behalf of the logged-in customer.
+    Saves the order to the database and returns a confirmation message with the
+    order ID, product name, and price.
     """
+    customer_id = runtime.context.customer_id
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT name, price FROM products WHERE id = ?", (product_id,))
@@ -96,8 +130,8 @@ def checkout(product_id: int) -> str:
 
     name, price = row
     cursor.execute(
-        "INSERT INTO orders (product_id, product_name, price) VALUES (?, ?, ?)",
-        (product_id, name, price),
+        "INSERT INTO orders (customer_id, product_id, product_name, price) VALUES (?, ?, ?, ?)",
+        (customer_id, product_id, name, price),
     )
     order_id = cursor.lastrowid
     conn.commit()
@@ -143,14 +177,44 @@ def describe_product_image(image_path: str) -> str:
     response = vision_llm.invoke([message])
     return response.content
 
+@tool
+def get_orders_history(runtime: ToolRuntime[CustomerContext]) -> str:
+    """
+    Retrieve the order history of the logged-in customer.
+    Returns a JSON array of orders, each with: order_id, product_id, product_name, price, order_date.
+    """
+    customer_id = runtime.context.customer_id
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, product_id, product_name, price, ordered_at FROM orders "
+        "WHERE customer_id = ? ORDER BY ordered_at DESC",
+        (customer_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    orders = [
+        {
+            "order_id":     row[0],
+            "product_id":   row[1],
+            "product_name": row[2],
+            "price":        row[3],
+            "order_date":   row[4],
+        }
+        for row in rows
+    ]
+    return json.dumps(orders)
+
 
 # ---------------------------------------------------------------------------
 # Agent
 # ---------------------------------------------------------------------------
 
 agent = create_agent(
-    tools=[search_products, get_rating, checkout, describe_product_image],
+    tools=[search_products, get_rating, checkout, describe_product_image, get_orders_history],
     model=llm,
+    context_schema=CustomerContext,
     system_prompt=(
         "You are a helpful shopping assistant. Follow these rules strictly.\n\n"
         "IMAGE SEARCH — when the user provides an image path:\n"
@@ -176,7 +240,10 @@ agent = create_agent(
         "2. Call checkout with that product_id (the number from (ID:X)).\n"
         "3. Confirm the order to the user in plain text.\n\n"
         "Never place an order unless the user explicitly confirms. "
-        "Never guess a product_id — always take it from the (ID:X) in your own previous message."
+        "Never guess a product_id — always take it from the (ID:X) in your own previous message.\n\n"
+        "ORDER HISTORY — when the user asks to see their order history (e.g. 'show my orders', 'what did I buy?'):\n"
+        "1. Call get_orders_history (the logged-in customer is identified automatically).\n"
+        "2. Present the order history in a clear, organized format.\n"
     ),
 )
 
@@ -191,6 +258,7 @@ if __name__ == "__main__":
                     ),
                 }
             ]
-        }
+        },
+        context=CustomerContext(customer_id=1, customer_name="John Doe"),
     )
     print(result["messages"][-1].content)
